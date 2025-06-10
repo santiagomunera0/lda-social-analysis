@@ -23,6 +23,16 @@ from gensim.models import CoherenceModel, LdaMulticore
 from kneed import KneeLocator
 import pyLDAvis.gensim_models
 
+# Load spaCy model once and enable GPU if available
+try:
+    GPU_ENABLED = spacy.prefer_gpu()
+    if GPU_ENABLED:
+        print("spaCy GPU enabled")
+except Exception:
+    GPU_ENABLED = False
+
+nlp = spacy.load("es_core_news_lg", disable=["parser", "ner"])
+
 
 # functions
 def create_folder(path_folder):
@@ -530,22 +540,18 @@ def process_words(
         texts = [
             [word for word in simple_preprocess(str(doc)) if word not in stop_words]
             for doc in texts
-        ]  # Stopwords removal
-        texts = [bigram_mod[doc] for doc in texts]  # Bigrams
-        # texts = [trigram_mod[bigram_mod[doc]] for doc in texts]#Trigrams
+        ]
+        texts = [bigram_mod[doc] for doc in texts]
 
     texts_out = []
-    nlp = spacy.load("es_core_news_lg", disable=["parser", "ner"])
-    for sent in texts:
-        doc = nlp(" ".join(sent))
-        texts_out.append(
-            [token.lemma_ for token in doc if token.pos_ in allowed_postags]
-        )  # Lemmatization
-    # Remove stopwords once more after lemmatization
-    texts_out = [
-        [word for word in simple_preprocess(str(doc)) if word not in stop_words]
-        for doc in texts_out
-    ]  # 2nd Stopwords removal
+    for doc in nlp.pipe([" ".join(sent) for sent in texts], batch_size=32):
+        lemma_tokens = [token.lemma_ for token in doc if token.pos_ in allowed_postags]
+        lemma_tokens = [
+            word
+            for word in simple_preprocess(" ".join(lemma_tokens))
+            if word not in stop_words
+        ]
+        texts_out.append(lemma_tokens)
 
     return texts_out
 
