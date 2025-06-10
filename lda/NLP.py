@@ -7,7 +7,7 @@ from tqdm import tqdm
 import re
 import emoji
 import numpy as np
-import json
+import orjson
 import pickle
 import time
 from datetime import datetime
@@ -22,6 +22,17 @@ from gensim import corpora, models
 from gensim.models import CoherenceModel, LdaMulticore
 from kneed import KneeLocator
 import pyLDAvis.gensim_models
+
+# Load spaCy model once and enable GPU if available
+try:
+    GPU_ENABLED = spacy.prefer_gpu()
+    if GPU_ENABLED:
+        print("spaCy GPU enabled")
+except Exception:
+    GPU_ENABLED = False
+
+nlp = spacy.load("es_core_news_lg", disable=["parser", "ner"])
+nlp.max_length = 2000000
 
 
 # functions
@@ -530,22 +541,21 @@ def process_words(
         texts = [
             [word for word in simple_preprocess(str(doc)) if word not in stop_words]
             for doc in texts
-        ]  # Stopwords removal
-        texts = [bigram_mod[doc] for doc in texts]  # Bigrams
-        # texts = [trigram_mod[bigram_mod[doc]] for doc in texts]#Trigrams
+        ]
+        texts = [bigram_mod[doc] for doc in texts]
 
     texts_out = []
-    nlp = spacy.load("es_core_news_lg", disable=["parser", "ner"])
-    for sent in texts:
-        doc = nlp(" ".join(sent))
-        texts_out.append(
-            [token.lemma_ for token in doc if token.pos_ in allowed_postags]
-        )  # Lemmatization
-    # Remove stopwords once more after lemmatization
-    texts_out = [
-        [word for word in simple_preprocess(str(doc)) if word not in stop_words]
-        for doc in texts_out
-    ]  # 2nd Stopwords removal
+    n_proc = 1 if GPU_ENABLED else cpu_count()
+    for doc in nlp.pipe(
+        [" ".join(sent) for sent in texts], batch_size=32, n_process=n_proc
+    ):
+        lemma_tokens = [token.lemma_ for token in doc if token.pos_ in allowed_postags]
+        lemma_tokens = [
+            word
+            for word in simple_preprocess(" ".join(lemma_tokens))
+            if word not in stop_words
+        ]
+        texts_out.append(lemma_tokens)
 
     return texts_out
 
@@ -618,20 +628,19 @@ def parallelize_dataframe(df, func, n_cores=cpu_count(), **kwargs):
 
         print("Is pandas Dataframe")
         type_df = "Pandas"
+        df_split = np.array_split(df, n_cores)
 
     elif isinstance(df, pl.DataFrame):
-        # Note: for the moment for multiprocess for polars is needed tu transform to pandas. Its important to find a way to multiprocess UDF in polars.
-        df = df.to_pandas()
         print("Is polars Dataframe")
         type_df = "Polars"
+        chunk_size = int(np.ceil(df.height / n_cores))
+        df_split = [df.slice(i * chunk_size, chunk_size).to_pandas() for i in range(n_cores)]
 
     else:
         print("Is not pandas or polars library")
+        return df
 
     pool = Pool(n_cores)
-
-    df_split = iter(np.array_split(df, n_cores))
-    del df
     if kwargs:
         async_results = [
             pool.apply_async(
@@ -640,10 +649,10 @@ def parallelize_dataframe(df, func, n_cores=cpu_count(), **kwargs):
             )
             for i in df_split
         ]
-        df = pd.concat([ar.get() for ar in async_results])
+        df_chunks = [ar.get() for ar in async_results]
 
     else:
-        df = pd.concat(
+        df_chunks = list(
             pool.map(
                 func,
                 df_split,
@@ -654,8 +663,9 @@ def parallelize_dataframe(df, func, n_cores=cpu_count(), **kwargs):
     pool.join()
 
     if type_df == "Polars":
-        df = pl.from_pandas(df)
-    return df
+        return pl.concat([pl.from_pandas(chunk) for chunk in df_chunks])
+    else:
+        return pd.concat(df_chunks)
 
 
 # LDA
@@ -1039,8 +1049,8 @@ def json_write(filename: str, metadata):
     Raise:
     """
 
-    with open(filename, "w", encoding="utf-8-sig") as fp:
-        json.dump(metadata, fp)
+    with open(filename, "wb") as fp:
+        fp.write(orjson.dumps(metadata))
 
 
 def json_read(filename: str):
@@ -1058,8 +1068,8 @@ def json_read(filename: str):
 
     Raise
     """
-    with open(filename, encoding='utf-8-sig') as f_in:
-        return json.load(f_in)
+    with open(filename, "rb") as f_in:
+        return orjson.loads(f_in.read())
 
 
 def write_metadata(
